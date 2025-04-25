@@ -37,7 +37,7 @@ def fetch_graph_data(endpoint, token, params=None):
 
 # 4. Normalisation des logs
 
-def normalize_log(log, log_type):
+def normalize_log(log, log_type, token):
     # Helpers pour naviguer dans les dicts potentiellement None
     def get_nested(d, *keys, default=None):
         for key in keys:
@@ -70,7 +70,9 @@ def normalize_log(log, log_type):
             "os": device.get("operatingSystem"),
             "device_id": device.get("deviceId"),
             "client_app_used": log.get("clientAppUsed"),
-            "app_display_name": log.get("appDisplayName")
+            "app_display_name": log.get("appDisplayName"),
+            "conditionalAccessStatus": log.get ("conditionalAccessStatus"),
+            "user_agent": log.get ("userAgent", "none")
         })
     elif log_type == "directoryAudit":
         # targetResources peut être None ou []
@@ -81,23 +83,65 @@ def normalize_log(log, log_type):
             "target": resources[0].get("displayName"),
             "modified_properties": resources[0].get("modifiedProperties")
         })
-    elif log_type == "riskyUser":
+
+    elif log_type == "securityAlert": # Microsoft Defender
+        file_name = None
+        file_path = None
+        hash_type = None
+        hash_value = None
+        fqdn = None
+        public_ip = None
+        destination_url = None
+        alert_id = log.get("id")
+        endpoint = f"https://graph.microsoft.com/v1.0/security/alerts/{alert_id}"
+        response_alert = requests.get(endpoint,headers={'Authorization': f'Bearer {token}'})
+        if response_alert.status_code == 200:
+            alert_data = response_alert.json()
+        category = alert_data.get("category")
+        description = alert_data.get("description")
+        if alert_data.get("fileStates"):
+            file_state = alert_data["fileStates"][0]
+            file_name = file_state.get("name")
+            file_path = file_state.get("path")
+        if "fileHash" in file_state:
+            hash_type = file_state["fileHash"].get("hashType")
+            hash_value = file_state["fileHash"].get("hashValue")
+        if alert_data.get("hostStates"):
+            host_state = alert_data["hostStates"][0]
+            fqdn = host_state.get("fqdn")
+            public_ip = host_state.get("publicIpAddress")
+        if alert_data.get("networkConnections"):
+            network_connection = alert_data["networkConnections"][0]
+            destination_url = network_connection.get("destinationUrl")
+        
+        
+            
         base.update({
-            "risk_detail": log.get("riskDetail"),
-            "risk_state": log.get("riskState")
-        })
-    elif log_type == "securityAlert":
-        base.update({
+            "alert_title": log.get("title"),
+            "alert_id": log.get("id"),
             "alert_severity": log.get("severity"),
-            "alert_status": log.get("status")
+            "alert_status": log.get("status"),
+            "alert_risk_score": log.get("riskScore"),
+            "alert_actor": log.get("actorDisplayName"),
+            "affected_user": log.get("userPrincipalName"),
+            "description": description,
+            "file_name": file_name,
+            "file_path": file_path,
+            "hash_type": hash_type,
+            "hash_value": hash_value,
+            "fqdn": fqdn,
+            "public_ip": public_ip,
+            "destination_url": destination_url
         })
+        
+            
+ 
     return base
 
 # 5. Paramètres de temps (24 dernières heures) et champs de filtre par type de log
 FILTER_FIELDS = {
     "signin": "createdDateTime",
     "directoryAudit": "activityDateTime",
-    "riskyUser": None,            # Aucune prise en charge du filtre
     "securityAlert": "createdDateTime"
 }
 
@@ -105,7 +149,6 @@ FILTER_FIELDS = {
 ENDPOINTS = [
     ("signin", "auditLogs/signIns"),
     ("directoryAudit", "auditLogs/directoryAudits"),
-    ("riskyUser", "identityProtection/riskyUsers"),
     ("securityAlert", "security/alerts")
 ]
 
@@ -128,19 +171,16 @@ def main():
             index_name = f"entra-id-{log_type}-logs1".lower()
 
             for log in logs:
-                normalized = normalize_log(log, log_type)
+                normalized = normalize_log(log, log_type, token)
                 es.index(index=index_name, document=normalized)
 
             print(f"Indexé {len(logs)} logs de type {log_type}")
 
         except requests.exceptions.HTTPError as http_err:
             status = http_err.response.status_code
-            if log_type == "riskyUser" and status == 403:
-                print(
-                    "Impossible d'accéder aux riskyUsers : licence Azure AD Premium P2 requise "
-                    "et permission 'IdentityRiskyUser.Read.All' (admin consent)."
-                )
-            elif log_type == "securityAlert" and status == 403:
+            
+                
+            if log_type == "securityAlert" and status == 403:
                 print(
                     "Impossible d'accéder aux securityAlerts : permission 'SecurityEvents.Read.All' et"
                     " rôle Security Reader ou Global Reader requis."
@@ -155,3 +195,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
