@@ -16,6 +16,7 @@ ELASTICSEARCH_USER = "elastic"
 ELASTICSEARCH_PASS = "22709769"
 
 TIME_WINDOW_SECONDS = 30  # Fenêtre de détection en secondes
+MIN_EVENTS_THRESHOLD = 2  # Nombre minimum d'événements pour créer une alerte
 
 # Setup logging
 logging.basicConfig(
@@ -44,7 +45,7 @@ def get_entra_id_logs():
             }
         },
         "sort": [{"@timestamp": {"order": "desc"}}],
-        "size": 500
+        "size": 1000
     }
     try:
         headers = {
@@ -56,7 +57,7 @@ def get_entra_id_logs():
             f"{ELASTICSEARCH_URL}/{ELASTICSEARCH_INDEX}/_search",
             headers=headers,
             data=json.dumps(query),
-            timeout=30
+            timeout=60
         )
         response.raise_for_status()
         return response.json().get("hits", {}).get("hits", [])
@@ -68,59 +69,88 @@ def get_entra_id_logs():
 
 def parse_log_timestamp(timestamp_str):
     try:
-        # Essayer de parser le format ISO d'abord
         return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
     except ValueError:
         try:
-            # Parser le format "Apr 30, 2025 @ 05:14:51.000"
             return dateutil.parser.parse(timestamp_str)
         except Exception as e:
             logger.error(f"Impossible de parser le timestamp {timestamp_str}: {str(e)}")
             return None
 
-def format_alert_description(log_data, extra_info=""):
+def format_alert_description(user_id, events):
     desc = [
-        "Détails de l'événement Entra-ID :\n",
-        f"Action : {log_data.get('action', 'Inconnue')}\n",
-        f"Catégorie : {log_data.get('event_type', 'SignIn Logs')}\n",
-        f"Utilisateur : {log_data.get('user_identifier', 'Inconnu')}\n",
-        f"IP Source : {log_data.get('source_ip', 'Inconnue')}\n",
-        f"Ville : {log_data.get('city', 'Inconnue')}\n",
-        f"Pays : {log_data.get('country', 'Inconnu')}\n",
-        f"Timestamp : {log_data.get('@timestamp', 'Inconnu')}\n",
-        f"Conditional Access : {log_data.get('conditionalAccessStatus', 'Inconnu')}",
+        f"Activite suspecte detectee pour l'utilisateur: {user_id}",
+        f"Nombre total de tentatives: {len(events)}",
+        f"Fenetre de detection: {TIME_WINDOW_SECONDS} secondes",
+        "",
+        "Détails des événements:",
+        ""
     ]
-    if extra_info:
+    
+    # Statistiques globales
+    locations = set()
+    ips = set()
+    timestamps = []
+    
+    for event in events:
+        locations.add(f"{event.get('city', 'Inconnue')}/{event.get('country', 'Inconnu')}")
+        ips.add(event.get('source_ip', 'Inconnue'))
+        timestamps.append(event.get('@timestamp', 'Inconnu'))
+    
+    desc.append(f"Localisations distinctes: {len(locations)}")
+    desc.append(f"IPs distinctes: {len(ips)}")
+    desc.append("")
+    
+    # Détails par événement
+    for i, event in enumerate(sorted(events, key=lambda x: x.get('@timestamp', '')), 1):
+        desc.append(f"Événement #{i}:")
+        desc.append(f"- Heure: {event.get('@timestamp', 'Inconnu')}")
+        desc.append(f"- Localisation: {event.get('city', 'Inconnue')}/{event.get('country', 'Inconnu')}")
+        desc.append(f"- Adresse IP: {event.get('source_ip', 'Inconnue')}")
+        desc.append(f"- Application: {event.get('app_display_name', 'Inconnue')}")
+        desc.append(f"- Status: {event.get('conditionalAccessStatus', 'Inconnu')}")
         desc.append("")
-        desc.append(f"Alerte supplémentaire : {extra_info}")
-
+    
     return "\n".join(desc)
 
-def extract_artifacts(log_data):
+def extract_artifacts(events):
     artifacts = []
-    if log_data.get('source_ip'):
-        artifacts.append({"dataType": "ip", "data": log_data['source_ip']})
-    if log_data.get('user_identifier'):
-        artifacts.append({"dataType": "mail", "data": log_data['user_identifier']})
-    if log_data.get('city'):
-        artifacts.append({"dataType": "city", "data": log_data['city']})
-    if log_data.get('country'):
-        artifacts.append({"dataType": "country", "data": log_data['country']})
+    
+    # IPs uniques
+    ips = {event.get('source_ip') for event in events if event.get('source_ip')}
+    for ip in ips:
+        artifacts.append({
+            "dataType": "ip",
+            "data": ip,
+            "tags": ["entra-id", "failed-login"]
+        })
+    
+   
     return artifacts
 
-def create_thehive_alert(log_data, extra_info=""):
+def create_thehive_alert(user_id, events):
+    if len(events) < MIN_EVENTS_THRESHOLD:
+        logger.info(f"Pas assez d'événements ({len(events)}) pour {user_id}")
+        return None
+
     alert = {
-        "title": f"Entra-ID-Connexion depuis plusieurs villes détectée: {log_data.get('action', 'Unknown')} - {log_data.get('user_identifier', 'Unknown')}",
-        "description": format_alert_description(log_data, extra_info),
-        "type": "external",
-        "source": "Elasticsearch",
-        "sourceRef": log_data.get('_id', str(datetime.now().timestamp())),
-        "severity": 2,
+        "title": f"[Entra-ID] Activite suspecte: {len(events)} tentatives pour {user_id}",
+        "description": format_alert_description(user_id, events),
+        "type": "entra-id-suspicious-login",
+        "source": "elasticsearch",
+        "sourceRef": f"entra-id-{user_id}-{datetime.now().timestamp()}",
+        "severity": 3 if len(events) < 5 else 4,  # 3=Medium, 4=High
         "date": int(datetime.now().timestamp() * 1000),
-        "tags": ["EntraID", "signInLogs", "failure"],
-        "observables": extract_artifacts(log_data),
-        "tlp": 2,
-        "pap": 2
+        "tags": [
+            "entra-id",
+            "failed-login",
+            "suspicious-activity",
+            f"locations:{len({(e.get('city'), e.get('country')) for e in events})}",
+            f"ips:{len({e.get('source_ip') for e in events})}"
+        ],
+        "observables": extract_artifacts(events),
+        "tlp": 2,  # AMBER
+        "pap": 2   # AMBER
     }
 
     try:
@@ -135,9 +165,17 @@ def create_thehive_alert(log_data, extra_info=""):
             data=json.dumps(alert),
             timeout=30
         )
+        
         if response.status_code == 201:
             alert_id = response.json().get("id", response.json().get("_id"))
-            logger.info(f"Alerte créée avec ID: {alert_id}")
+            logger.info(f"Alerte créée avec succès pour {user_id} (ID: {alert_id})")
+            alert_id = response.json()["_id"]
+            for obs in extract_artifacts(events):
+                requests.post(
+                    f"{THEHIVE_URL}/api/v1/alert/{alert_id}/artifact",
+                    headers=headers,
+                    data=json.dumps(obs)
+                )
             return response.json()
         else:
             logger.error(f"Erreur TheHive {response.status_code}: {response.text}")
@@ -146,49 +184,41 @@ def create_thehive_alert(log_data, extra_info=""):
         logger.error(f"Exception lors de la création d'une alerte : {str(e)}")
         return None
 
-def detect_suspicious_user_movements(logs):
-    user_movements = defaultdict(list)
-
-    for log in logs:
-        log_source = log.get('_source', {})
-        user_id = log_source.get('user_identifier')
-        city = log_source.get('city')
-        timestamp_str = log_source.get('@timestamp')
-
-        if user_id and city and timestamp_str:
-            timestamp = parse_log_timestamp(timestamp_str)
-            if timestamp:
-                user_movements[user_id].append((timestamp, city, log_source))
-
-    suspicious_logs = []
-    for user_id, entries in user_movements.items():
-        # Trier par timestamp
-        entries.sort(key=lambda x: x[0])
+def analyze_user_activity(events):
+    # Trier les événements par date
+    sorted_events = sorted(events, key=lambda x: x[0])
+    
+    suspicious_events = []
+    current_window = []
+    
+    for timestamp, event in sorted_events:
+        # Nettoyer la fenêtre des événements trop anciens
+        current_window = [
+            (ts, evt) for ts, evt in current_window
+            if (timestamp - ts).total_seconds() <= TIME_WINDOW_SECONDS
+        ]
         
-        # Vérifier les mouvements dans la fenêtre temporelle
-        for i in range(len(entries)):
-            timestamp_i, city_i, log_i = entries[i]
-            cities_in_window = {city_i}
-            
-            for j in range(i + 1, len(entries)):
-                timestamp_j, city_j, log_j = entries[j]
-                time_diff = (timestamp_j - timestamp_i).total_seconds()
-                
-                if time_diff <= TIME_WINDOW_SECONDS:
-                    cities_in_window.add(city_j)
-                    if len(cities_in_window) > 1:
-                        # Ajouter tous les logs concernés
-                        if log_i not in suspicious_logs:
-                            suspicious_logs.append(log_i)
-                        if log_j not in suspicious_logs:
-                            suspicious_logs.append(log_j)
-                else:
-                    break
-
-    return suspicious_logs
+        current_window.append((timestamp, event))
+        
+        # Vérifier si on a plusieurs localisations dans la fenêtre courante
+        locations = {(evt.get('city'), evt.get('country')) for ts, evt in current_window}
+        if len(locations) > 1 and len(current_window) >= MIN_EVENTS_THRESHOLD:
+            suspicious_events.extend([evt for ts, evt in current_window])
+    
+    # Éliminer les doublons
+    unique_events = []
+    seen_ids = set()
+    for evt in suspicious_events:
+        event_id = evt.get('_id', str(evt.get('@timestamp', ''))) + evt.get('source_ip', '')
+        if event_id not in seen_ids:
+            seen_ids.add(event_id)
+            unique_events.append(evt)
+    
+    return unique_events
 
 def main():
     logger.info("Démarrage du traitement...")
+    start_time = datetime.now()
 
     # Test de connexion Elasticsearch
     try:
@@ -205,21 +235,36 @@ def main():
         return
 
     # Récupérer les logs
+    logger.info("Récupération des logs depuis Elasticsearch...")
     logs = get_entra_id_logs()
     logger.info(f"Nombre de logs récupérés : {len(logs)}")
 
-    # Détection des mouvements suspects
-    suspicious_logs = detect_suspicious_user_movements(logs)
-    logger.info(f"Nombre de logs suspects détectés : {len(suspicious_logs)}")
+    # Organiser les événements par utilisateur
+    user_events = defaultdict(list)
+    for log in logs:
+        log_source = log.get('_source', {})
+        user_id = log_source.get('user_identifier')
+        timestamp_str = log_source.get('@timestamp')
+        
+        if user_id and timestamp_str:
+            timestamp = parse_log_timestamp(timestamp_str)
+            if timestamp:
+                user_events[user_id].append((timestamp, log_source))
 
-    # Création des alertes pour les logs suspects
+    # Analyser l'activité de chaque utilisateur
+    logger.info("Analyse des activités suspectes...")
     alert_count = 0
-    for log in suspicious_logs:
-        result = create_thehive_alert(log, "Connexion depuis plusieurs villes détectée en moins de 30 secondes")
-        if result:
-            alert_count += 1
+    for user_id, events in user_events.items():
+        suspicious_events = analyze_user_activity(events)
+        if suspicious_events:
+            result = create_thehive_alert(user_id, suspicious_events)
+            if result:
+                alert_count += 1
 
-    logger.info(f"Traitement terminé. {alert_count} alertes créées.")
+    # Statistiques finales
+    duration = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Traitement terminé en {duration:.2f} secondes")
+    logger.info(f"Nombre total d'alertes créées : {alert_count}")
 
 if __name__ == "__main__":
     main()
