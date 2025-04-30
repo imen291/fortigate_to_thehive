@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+import requests
+import json
+from datetime import datetime, timedelta
+import logging
+import base64
+from collections import defaultdict
+import dateutil.parser
+
+# Configuration
+THEHIVE_URL = "http://192.168.100.25:9000"
+THEHIVE_API_KEY = "hzwsftd/mfDR68blnzkb1jh0qBNyye6/"
+ELASTICSEARCH_URL = "http://localhost:9200"
+ELASTICSEARCH_INDEX = "entra-id-signin-logs1"
+ELASTICSEARCH_USER = "elastic"
+ELASTICSEARCH_PASS = "22709769"
+
+TIME_WINDOW_SECONDS = 30  # Fenêtre de détection en secondes
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def get_elasticsearch_auth():
+    auth_string = f"{ELASTICSEARCH_USER}:{ELASTICSEARCH_PASS}"
+    return f"Basic {base64.b64encode(auth_string.encode()).decode()}"
+
+def get_entra_id_logs():
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"action.keyword": "failed"}},
+                    {"exists": {"field": "user_identifier"}}
+                ],
+                "should": [
+                    {"term": {"conditionalAccessStatus.keyword": "failure"}},
+                    {"term": {"conditionalAccessStatus.keyword": "notApplied"}}
+                ],
+                "minimum_should_match": 1
+            }
+        },
+        "sort": [{"@timestamp": {"order": "desc"}}],
+        "size": 500
+    }
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": get_elasticsearch_auth()
+        }
+
+        response = requests.post(
+            f"{ELASTICSEARCH_URL}/{ELASTICSEARCH_INDEX}/_search",
+            headers=headers,
+            data=json.dumps(query),
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json().get("hits", {}).get("hits", [])
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erreur Elasticsearch : {str(e)}")
+        if e.response:
+            logger.error(f"Détails : {e.response.text}")
+        return []
+
+def parse_log_timestamp(timestamp_str):
+    try:
+        # Essayer de parser le format ISO d'abord
+        return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+    except ValueError:
+        try:
+            # Parser le format "Apr 30, 2025 @ 05:14:51.000"
+            return dateutil.parser.parse(timestamp_str)
+        except Exception as e:
+            logger.error(f"Impossible de parser le timestamp {timestamp_str}: {str(e)}")
+            return None
+
+def format_alert_description(log_data, extra_info=""):
+    desc = [
+        "Détails de l'événement Entra-ID :\n",
+        f"Action : {log_data.get('action', 'Inconnue')}\n",
+        f"Catégorie : {log_data.get('event_type', 'SignIn Logs')}\n",
+        f"Utilisateur : {log_data.get('user_identifier', 'Inconnu')}\n",
+        f"IP Source : {log_data.get('source_ip', 'Inconnue')}\n",
+        f"Ville : {log_data.get('city', 'Inconnue')}\n",
+        f"Pays : {log_data.get('country', 'Inconnu')}\n",
+        f"Timestamp : {log_data.get('@timestamp', 'Inconnu')}\n",
+        f"Conditional Access : {log_data.get('conditionalAccessStatus', 'Inconnu')}",
+    ]
+    if extra_info:
+        desc.append("")
+        desc.append(f"Alerte supplémentaire : {extra_info}")
+
+    return "\n".join(desc)
+
+def extract_artifacts(log_data):
+    artifacts = []
+    if log_data.get('source_ip'):
+        artifacts.append({"dataType": "ip", "data": log_data['source_ip']})
+    if log_data.get('user_identifier'):
+        artifacts.append({"dataType": "mail", "data": log_data['user_identifier']})
+    if log_data.get('city'):
+        artifacts.append({"dataType": "city", "data": log_data['city']})
+    if log_data.get('country'):
+        artifacts.append({"dataType": "country", "data": log_data['country']})
+    return artifacts
+
+def create_thehive_alert(log_data, extra_info=""):
+    alert = {
+        "title": f"Entra-ID-Connexion depuis plusieurs villes détectée: {log_data.get('action', 'Unknown')} - {log_data.get('user_identifier', 'Unknown')}",
+        "description": format_alert_description(log_data, extra_info),
+        "type": "external",
+        "source": "Elasticsearch",
+        "sourceRef": log_data.get('_id', str(datetime.now().timestamp())),
+        "severity": 2,
+        "date": int(datetime.now().timestamp() * 1000),
+        "tags": ["EntraID", "signInLogs", "failure"],
+        "observables": extract_artifacts(log_data),
+        "tlp": 2,
+        "pap": 2
+    }
+
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {THEHIVE_API_KEY}"
+        }
+
+        response = requests.post(
+            f"{THEHIVE_URL}/api/v1/alert",
+            headers=headers,
+            data=json.dumps(alert),
+            timeout=30
+        )
+        if response.status_code == 201:
+            alert_id = response.json().get("id", response.json().get("_id"))
+            logger.info(f"Alerte créée avec ID: {alert_id}")
+            return response.json()
+        else:
+            logger.error(f"Erreur TheHive {response.status_code}: {response.text}")
+            return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Exception lors de la création d'une alerte : {str(e)}")
+        return None
+
+def detect_suspicious_user_movements(logs):
+    user_movements = defaultdict(list)
+
+    for log in logs:
+        log_source = log.get('_source', {})
+        user_id = log_source.get('user_identifier')
+        city = log_source.get('city')
+        timestamp_str = log_source.get('@timestamp')
+
+        if user_id and city and timestamp_str:
+            timestamp = parse_log_timestamp(timestamp_str)
+            if timestamp:
+                user_movements[user_id].append((timestamp, city, log_source))
+
+    suspicious_logs = []
+    for user_id, entries in user_movements.items():
+        # Trier par timestamp
+        entries.sort(key=lambda x: x[0])
+        
+        # Vérifier les mouvements dans la fenêtre temporelle
+        for i in range(len(entries)):
+            timestamp_i, city_i, log_i = entries[i]
+            cities_in_window = {city_i}
+            
+            for j in range(i + 1, len(entries)):
+                timestamp_j, city_j, log_j = entries[j]
+                time_diff = (timestamp_j - timestamp_i).total_seconds()
+                
+                if time_diff <= TIME_WINDOW_SECONDS:
+                    cities_in_window.add(city_j)
+                    if len(cities_in_window) > 1:
+                        # Ajouter tous les logs concernés
+                        if log_i not in suspicious_logs:
+                            suspicious_logs.append(log_i)
+                        if log_j not in suspicious_logs:
+                            suspicious_logs.append(log_j)
+                else:
+                    break
+
+    return suspicious_logs
+
+def main():
+    logger.info("Démarrage du traitement...")
+
+    # Test de connexion Elasticsearch
+    try:
+        test_response = requests.get(
+            ELASTICSEARCH_URL,
+            headers={"Authorization": get_elasticsearch_auth()},
+            timeout=10
+        )
+        if test_response.status_code != 200:
+            logger.error("Connexion à Elasticsearch échouée.")
+            return
+    except Exception as e:
+        logger.error(f"Test de connexion Elasticsearch échoué : {str(e)}")
+        return
+
+    # Récupérer les logs
+    logs = get_entra_id_logs()
+    logger.info(f"Nombre de logs récupérés : {len(logs)}")
+
+    # Détection des mouvements suspects
+    suspicious_logs = detect_suspicious_user_movements(logs)
+    logger.info(f"Nombre de logs suspects détectés : {len(suspicious_logs)}")
+
+    # Création des alertes pour les logs suspects
+    alert_count = 0
+    for log in suspicious_logs:
+        result = create_thehive_alert(log, "Connexion depuis plusieurs villes détectée en moins de 30 secondes")
+        if result:
+            alert_count += 1
+
+    logger.info(f"Traitement terminé. {alert_count} alertes créées.")
+
+if __name__ == "__main__":
+    main()
