@@ -4,15 +4,16 @@ from datetime import datetime, timedelta
 
 # 1. Authentification Azure AD
 def get_auth_token():
-    auth_url = "https://login.microsoftonline.com/tenant_id/oauth2/v2.0/token"
+    auth_url = "https://login.microsoftonline.com/tennant_id/oauth2/v2.0/token"
     auth_data = {
-        'client_id': 'c1f1b12c-09c0-4741',
-        'client_secret': 'ijS8QU2PHrc~fCv',
+        'client_id': 'g1',
+        'client_secret': 'f',
         'scope': 'https://graph.microsoft.com/.default',
         'grant_type': 'client_credentials'
     }
     response = requests.post(auth_url, data=auth_data)
     response.raise_for_status()
+    #print (response.json()['access_token'])
     return response.json()['access_token']
 
 # 2. Configuration Elasticsearch
@@ -36,9 +37,7 @@ def fetch_graph_data(endpoint, token, params=None):
     return results
 
 # 4. Normalisation des logs
-
 def normalize_log(log, log_type, token):
-    # Helpers pour naviguer dans les dicts potentiellement None
     def get_nested(d, *keys, default=None):
         for key in keys:
             if not isinstance(d, dict):
@@ -71,11 +70,10 @@ def normalize_log(log, log_type, token):
             "device_id": device.get("deviceId"),
             "client_app_used": log.get("clientAppUsed"),
             "app_display_name": log.get("appDisplayName"),
-            "conditionalAccessStatus": log.get ("conditionalAccessStatus"),
-            "user_agent": log.get ("userAgent", "none")
+            "conditionalAccessStatus": log.get("conditionalAccessStatus"),
+            "user_agent": log.get("userAgent", "none")
         })
     elif log_type == "directoryAudit":
-        # targetResources peut être None ou []
         resources = log.get("targetResources") or [{}]
         base.update({
             "action": log.get("activityDisplayName"),
@@ -83,66 +81,83 @@ def normalize_log(log, log_type, token):
             "target": resources[0].get("displayName"),
             "modified_properties": resources[0].get("modifiedProperties")
         })
+    elif log_type == "securityAlert":
+        # Extraction des informations d'email
+        email_info = {
+            "is_phishing": False,
+            "sender": None,
+            "recipient": None,
+            "subject": None,
+            "reporting_user": None
+        }
 
-    elif log_type == "securityAlert":  # Microsoft Defender
-        file_name = None
-        file_path = None
-        hash_type = None
-        hash_value = None
-        fqdn = None
-        public_ip = None
-        destination_url = None
-        alert_id = log.get("id")
-        endpoint = f"https://graph.microsoft.com/v1.0/security/alerts/{alert_id}"
-        response_alert = requests.get(endpoint, headers={'Authorization': f'Bearer {token}'})
-        if response_alert.status_code == 200:
-            alert_data = response_alert.json()
-            category = alert_data.get("category")
-            description = alert_data.get("description")
-        
-            if alert_data.get("fileStates"):
-                file_state = alert_data["fileStates"][0]
-                file_name = file_state.get("name")
-                file_path = file_state.get("path")
+        # Détection de phishing
+        title = (log.get("title") or "").lower()
+        description = (log.get("description") or "").lower()
+        if "phish" in title or "phish" in description:
+            email_info["is_phishing"] = True
 
-                if "fileHash" in file_state:
-                    hash_type = file_state["fileHash"].get("hashType")
-                    hash_value = file_state["fileHash"].get("hashValue")
-        
-            if alert_data.get("hostStates"):
-                host_state = alert_data["hostStates"][0]
-                fqdn = host_state.get("fqdn")
-                public_ip = host_state.get("publicIpAddress")
-        
-            if alert_data.get("networkConnections"):
-                network_connection = alert_data["networkConnections"][0]
-                destination_url = network_connection.get("destinationUrl")
-
-        
-        
+        # Extraction des informations depuis userStates
+        user_states = log.get("userStates", [])
+        for user in user_states:
+            email_role = user.get("emailRole", "").lower()
+            user_email = user.get("userPrincipalName")
             
+            if email_role == "sender":
+                email_info["sender"] = user_email
+            elif email_role == "recipient":
+                email_info["recipient"] = user_email
+            elif email_role == "unknown":
+                email_info["reporting_user"] = user_email
+
+        # Extraction du sujet depuis la description
+        if "subject:" in description:
+            try:
+                email_info["subject"] = description.split("subject:")[1].split("\n")[0].strip()
+            except:
+                pass
+
+        # Récupération des détails supplémentaires si disponible
+        alert_details = {}
+        alert_id = log.get("id")
+        if alert_id:
+            try:
+                endpoint = f"https://graph.microsoft.com/v1.0/security/alerts/{alert_id}"
+                response_alert = requests.get(endpoint, headers={'Authorization': f'Bearer {token}'})
+                if response_alert.status_code == 200:
+                    alert_data = response_alert.json()
+                    alert_details = {
+                        "file_name": get_nested(alert_data, "fileStates", 0, "name"),
+                        "file_path": get_nested(alert_data, "fileStates", 0, "path"),
+                        "fqdn": get_nested(alert_data, "hostStates", 0, "fqdn"),
+                        "public_ip": get_nested(alert_data, "hostStates", 0, "publicIpAddress"),
+                        "destination_url": get_nested(alert_data, "networkConnections", 0, "destinationUrl")
+                    }
+            except Exception as e:
+                print(f"Erreur lors de la récupération des détails de l'alerte {alert_id}: {e}")
+
         base.update({
             "alert_title": log.get("title"),
-            "alert_id": log.get("id"),
+            "alert_id": alert_id,
             "alert_severity": log.get("severity"),
             "alert_status": log.get("status"),
             "alert_risk_score": log.get("riskScore"),
             "alert_actor": log.get("actorDisplayName"),
-            "affected_user": log.get("userPrincipalName"),
+            "affected_user": email_info["recipient"],
             "description": description,
-            "file_name": file_name,
-            "file_path": file_path,
-            "hash_type": hash_type,
-            "hash_value": hash_value,
-            "fqdn": fqdn,
-            "public_ip": public_ip,
-            "destination_url": destination_url
+            # Informations sur l'email
+            "is_phishing_email": email_info["is_phishing"],
+            "email_sender": email_info["sender"],
+            "email_recipient": email_info["recipient"],
+            "email_subject": email_info["subject"],
+            "reporting_user": email_info["reporting_user"],
+            # Détails supplémentaires
+            **alert_details,
+            # URL de l'alerte
+            "alert_url": next((s for s in log.get("sourceMaterials", []) if "security.microsoft.com" in s), None)
         })
-        
-            
- 
-    return base
 
+    return base
 # 5. Paramètres de temps (24 dernières heures) et champs de filtre par type de log
 FILTER_FIELDS = {
     "signin": "createdDateTime",
