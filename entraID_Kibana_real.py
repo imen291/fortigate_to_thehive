@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 def get_auth_token():
     auth_url = "https://login.microsoftonline.com/tenant_id/oauth2/v2.0/token"
     auth_data = {
-        'client_id': '**',
-        'client_secret': **',
+        'client_id': 'c1f1b12c-09c0-4741',
+        'client_secret': 'ijS8QU2PHrc~fCv',
         'scope': 'https://graph.microsoft.com/.default',
         'grant_type': 'client_credentials'
     }
@@ -84,7 +84,7 @@ def normalize_log(log, log_type, token):
             "modified_properties": resources[0].get("modifiedProperties")
         })
 
-    elif log_type == "securityAlert": # Microsoft Defender
+    elif log_type == "securityAlert":  # Microsoft Defender
         file_name = None
         file_path = None
         hash_type = None
@@ -94,25 +94,30 @@ def normalize_log(log, log_type, token):
         destination_url = None
         alert_id = log.get("id")
         endpoint = f"https://graph.microsoft.com/v1.0/security/alerts/{alert_id}"
-        response_alert = requests.get(endpoint,headers={'Authorization': f'Bearer {token}'})
+        response_alert = requests.get(endpoint, headers={'Authorization': f'Bearer {token}'})
         if response_alert.status_code == 200:
             alert_data = response_alert.json()
-        category = alert_data.get("category")
-        description = alert_data.get("description")
-        if alert_data.get("fileStates"):
-            file_state = alert_data["fileStates"][0]
-            file_name = file_state.get("name")
-            file_path = file_state.get("path")
-        if "fileHash" in file_state:
-            hash_type = file_state["fileHash"].get("hashType")
-            hash_value = file_state["fileHash"].get("hashValue")
-        if alert_data.get("hostStates"):
-            host_state = alert_data["hostStates"][0]
-            fqdn = host_state.get("fqdn")
-            public_ip = host_state.get("publicIpAddress")
-        if alert_data.get("networkConnections"):
-            network_connection = alert_data["networkConnections"][0]
-            destination_url = network_connection.get("destinationUrl")
+            category = alert_data.get("category")
+            description = alert_data.get("description")
+        
+            if alert_data.get("fileStates"):
+                file_state = alert_data["fileStates"][0]
+                file_name = file_state.get("name")
+                file_path = file_state.get("path")
+
+                if "fileHash" in file_state:
+                    hash_type = file_state["fileHash"].get("hashType")
+                    hash_value = file_state["fileHash"].get("hashValue")
+        
+            if alert_data.get("hostStates"):
+                host_state = alert_data["hostStates"][0]
+                fqdn = host_state.get("fqdn")
+                public_ip = host_state.get("publicIpAddress")
+        
+            if alert_data.get("networkConnections"):
+                network_connection = alert_data["networkConnections"][0]
+                destination_url = network_connection.get("destinationUrl")
+
         
         
             
@@ -195,5 +200,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
