@@ -59,6 +59,11 @@ def parse_log(line):
         if not fields:
             return None
 
+        # ➔ FILTRE ici : on ignore si action=accept ou type=perf-stats
+        if fields.get("action") == "accept" or fields.get("action") == "perf-stats" or fields.get("action") == "timeout"or fields.get("subtype") == "local" or fields.get("dstip") == "8.8.8.8":
+            logging.info(f"Log ignoré (filtré) : {line.strip()}")
+            return None
+
         # Cast certains champs à int si possible
         int_fields = [
             'srcport', 'dstport', 'policyid', 'sentbyte',
@@ -80,6 +85,7 @@ def parse_log(line):
     except Exception as e:
         logging.error(f"Erreur parsing: {e}")
         return None
+
 
 def process_logs():
     """Lit le fichier existant + suit les nouveaux logs"""
