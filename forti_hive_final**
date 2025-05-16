@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+import requests
+import json
+from datetime import datetime, timedelta
+import logging
+import base64
+from collections import defaultdict
+import dateutil.parser
+
+# Configuration
+THEHIVE_URL = "http://192.168.100.25:9000"
+THEHIVE_API_KEY = "hzwsftd/mfDR68blnzkb1jh0qBNyye6/"
+ELASTICSEARCH_URL = "http://localhost:9200"
+ELASTICSEARCH_INDEX = "fortigate-logs"
+ELASTICSEARCH_USER = "elastic"
+ELASTICSEARCH_PASS = "22709769"
+
+TIME_WINDOW_SECONDS = 300  
+MIN_EVENTS_THRESHOLD = 3  
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def get_elasticsearch_auth():
+    auth_string = f"{ELASTICSEARCH_USER}:{ELASTICSEARCH_PASS}"
+    return f"Basic {base64.b64encode(auth_string.encode()).decode()}"
+
+def parse_log_timestamp(timestamp):
+    """Robust timestamp parser with validation and error handling"""
+    if not timestamp:
+        return None
+
+    try:
+        # Handle numeric timestamps (epoch format)
+        if isinstance(timestamp, (int, float)):
+            # Check if it's nanoseconds (common in some systems)
+            if timestamp > 1e18:  # > 1 quintillion (nanoseconds since epoch)
+                timestamp = timestamp / 1e9
+            # Check if it's microseconds
+            elif timestamp > 1e15:  # > 1 quadrillion (microseconds since epoch)
+                timestamp = timestamp / 1e6
+            # Check if it's milliseconds
+            elif timestamp > 1e12:  # > 1 trillion (milliseconds since epoch)
+                timestamp = timestamp / 1000
+            
+            # Validate reasonable time range (2000-2100)
+            if 946684800 < timestamp < 4102444800:  # 2000-01-01 to 2100-01-01
+                return datetime.fromtimestamp(timestamp)
+            logger.warning(f"Unreasonable epoch value: {timestamp}")
+            return None
+
+        # Handle string timestamps
+        if isinstance(timestamp, str):
+            # Clean common problematic characters
+            clean_ts = timestamp.strip().replace('©', '@').replace('�', '')
+            
+            # Try ISO format first
+            try:
+                dt = datetime.fromisoformat(clean_ts.replace('Z', '+00:00'))
+                if 2000 < dt.year < 2100:
+                    return dt
+            except ValueError:
+                pass
+                
+            # Try FortiGate format (May 15, 2025 @ 01:00:00.000)
+            try:
+                dt = datetime.strptime(clean_ts, "%b %d, %Y @ %H:%M:%S.%f")
+                if 2000 < dt.year < 2100:
+                    return dt
+            except ValueError:
+                pass
+                
+            # Fallback to dateutil parser
+            try:
+                dt = dateutil.parser.parse(clean_ts)
+                if 2000 < dt.year < 2100:
+                    return dt
+            except Exception:
+                logger.error(f"Failed to parse timestamp: {clean_ts}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Timestamp parsing error: {str(e)}")
+    return None
+
+def get_fortigate_logs():
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"type.keyword": "utm"}},
+                    {"term": {"subtype.keyword": "ips"}},
+                    {"terms": {"severity": ["critical", "high"]}}
+                ]
+            }
+        },
+        "sort": [{"eventtime": {"order": "desc"}}],
+        "size": 500,
+        "_source": ["srcip", "dstip", "dstport", "action", "severity", "attack", "eventtime", "date", "@timestamp"]
+    }
+    
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": get_elasticsearch_auth()
+        }
+
+        response = requests.post(
+            f"{ELASTICSEARCH_URL}/{ELASTICSEARCH_INDEX}/_search",
+            headers=headers,
+            data=json.dumps(query),
+            timeout=60
+        )
+        response.raise_for_status()
+        return response.json().get("hits", {}).get("hits", [])
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Elasticsearch error: {str(e)}")
+        if e.response:
+            logger.error(f"Details: {e.response.text}")
+        return []
+
+def format_alert_description(src_ip, events):
+    """Generate detailed alert description"""
+    desc = [
+        f"Suspicious activity detected from source IP: {src_ip}",
+        f"Total attack events: {len(events)}",
+        f"Detection window: {TIME_WINDOW_SECONDS} seconds",
+        "",
+        "Attack summary:",
+        f"- Attack type: {events[0].get('attack', 'unknown')}",
+        f"- Target IPs: {', '.join({e.get('dstip', 'unknown') for e in events})}",
+        f"- Unique target ports: {len({e.get('dstport') for e in events})}",
+        "",
+        "Sample events:"
+    ]
+    
+    for i, event in enumerate(events[:3], 1):
+        event_time = parse_log_timestamp(event.get('eventtime') or event.get('date') or event.get('@timestamp'))
+        time_str = event_time.strftime("%Y-%m-%d %H:%M:%S") if event_time else "unknown time"
+        desc.append(
+            f"{i}. {time_str} - "
+            f"{event.get('dstip', 'unknown')}:{event.get('dstport', 'unknown')} - "
+            f"{event.get('action', 'unknown')} - {event.get('severity', 'unknown')}"
+        )
+    
+    if len(events) > 3:
+        desc.append(f"... and {len(events)-3} more events")
+    
+    return "\n".join(desc)
+
+def extract_artifacts(events):
+    """Extract observables from events"""
+    artifacts = []
+    
+    src_ip = events[0].get('srcip')
+    if src_ip:
+        artifacts.append({
+            "dataType": "ip",
+            "data": src_ip,
+            "tags": ["fortigate", "attacker"]
+        })
+    
+    dst_ips = {event.get('dstip') for event in events if event.get('dstip')}
+    for ip in dst_ips:
+        artifacts.append({
+            "dataType": "ip",
+            "data": ip,
+            "tags": ["fortigate", "target"]
+        })
+    
+    attack = events[0].get('attack')
+    if attack:
+        artifacts.append({
+            "dataType": "other",
+            "data": attack,
+            "tags": ["fortigate", "attack-pattern"]
+        })
+    
+    return artifacts
+
+def create_thehive_alert(src_ip, events):
+    if len(events) < MIN_EVENTS_THRESHOLD:
+        logger.info(f"Not enough events ({len(events)}) for {src_ip}")
+        return None
+
+    # Get the earliest valid event time
+    event_times = []
+    for e in events:
+        ts = None
+        for field in ['eventtime', 'date', '@timestamp']:
+            if field in e:
+                ts = parse_log_timestamp(e[field])
+                if ts:
+                    break
+        if ts:
+            event_times.append(ts)
+
+    alert_date = min(event_times) if event_times else datetime.now()
+    
+    # Create unique sourceRef using hash of events
+    events_hash = hash(tuple(json.dumps(e, sort_keys=True) for e in events))
+    source_ref = f"fortigate-{src_ip}-{abs(events_hash)}"[:64]  # Limit length
+    
+    attack = events[0].get('attack', 'unknown')
+    max_severity = max((3 if e.get('severity') == 'high' else 4 for e in events), default=3)
+
+    alert = {
+        "title": f"[FortiGate] {attack} attack: {len(events)} events from {src_ip}",
+        "description": format_alert_description(src_ip, events),
+        "type": "fortigate-ips-alert",
+        "source": "elasticsearch",
+        "sourceRef": source_ref,  # Now using event-based hash
+        "severity": max_severity,
+        "date": int(datetime.now().timestamp() * 1000),
+        "tags": [
+            "fortigate",
+            "ips",
+            attack.lower().replace('.', '-'),
+            f"targets:{len({e.get('dstip') for e in events})}"
+        ],
+        "artifacts": extract_artifacts(events),
+        "tlp": 2,
+        "pap": 2
+    }
+
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {THEHIVE_API_KEY}"
+        }
+
+        # First check if alert exists
+        check_response = requests.get(
+            f"{THEHIVE_URL}/api/v1/alert?sourceRef={source_ref}",
+            headers=headers,
+            timeout=10
+        )
+        
+        if check_response.status_code == 200 and check_response.json():
+            logger.info(f"Alert already exists for {src_ip} (SourceRef: {source_ref})")
+            return None
+
+        # Create new alert
+        response = requests.post(
+            f"{THEHIVE_URL}/api/v1/alert",
+            headers=headers,
+            data=json.dumps(alert),
+            timeout=30
+        )
+        
+        if response.status_code == 201:
+            alert_id = response.json().get("id", response.json().get("_id"))
+            logger.info(f"Alert created successfully for {src_ip} (ID: {alert_id})")
+            for obs in extract_artifacts(events):
+                requests.post(
+                    f"{THEHIVE_URL}/api/v1/alert/{alert_id}/artifact",
+                    headers=headers,
+                    data=json.dumps(obs)
+                )
+            return response.json()
+        else:
+            logger.error(f"TheHive error {response.status_code}: {response.text}")
+            return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Exception while creating alert: {str(e)}")
+        return None
+def group_events_by_source_ip(logs):
+    ip_events = defaultdict(list)
+    for log in logs:
+        log_source = log.get('_source', {})
+        src_ip = log_source.get('srcip')
+        if src_ip:
+            ip_events[src_ip].append(log_source)
+    return ip_events
+
+def main():
+    logger.info("Starting FortiGate log processing...")
+    start_time = datetime.now()
+
+    # Test Elasticsearch connection
+    try:
+        test_response = requests.get(
+            ELASTICSEARCH_URL,
+            headers={"Authorization": get_elasticsearch_auth()},
+            timeout=10
+        )
+        if test_response.status_code != 200:
+            logger.error("Failed to connect to Elasticsearch.")
+            return
+    except Exception as e:
+        logger.error(f"Elasticsearch connection test failed: {str(e)}")
+        return
+
+    # Get logs
+    logger.info("Fetching FortiGate logs from Elasticsearch...")
+    logs = get_fortigate_logs()
+    logger.info(f"Number of logs retrieved: {len(logs)}")
+
+    # Group events by source IP
+    ip_events = group_events_by_source_ip(logs)
+
+    # Create alerts
+    logger.info("Creating alerts for suspicious activities...")
+    alert_count = 0
+    for src_ip, events in ip_events.items():
+        if len(events) >= MIN_EVENTS_THRESHOLD:
+            result = create_thehive_alert(src_ip, events)
+            if result:
+                alert_count += 1
+
+    # Final statistics
+    duration = (datetime.now() - start_time).total_seconds()
+    logger.info(f"Processing completed in {duration:.2f} seconds")
+    logger.info(f"Total alerts created: {alert_count}")
+
+if __name__ == "__main__":
+    main()
