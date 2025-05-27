@@ -112,7 +112,10 @@ class FortiGateAlertProcessor:
         
         logger.info(f"Created {alert_count} {alert_type.upper()} alerts")
         return alert_count
+        
 
+    
+    
     def create_alert(self, src_ip, events, alert_type):
         alert_config = ALERT_CONFIG[alert_type]
         event_data = events[0]
@@ -127,13 +130,13 @@ class FortiGateAlertProcessor:
             description = self.format_ips_description(src_ip, events)
             severity = alert_config['severity_mapping'].get(event_data.get('severity', 'high'), 3)
             tags = ["ips", "attack", event_data.get('attack', 'unknown').lower()]
-            artifacts = self.create_ips_artifacts(src_ip, events)
+            
         else:  # p2p
             title = f"[FortiGate] P2P: {event_data.get('app', 'Activity')} from {src_ip}"
             description = self.format_p2p_description(src_ip, events)
             severity = alert_config['severity_mapping'].get(event_data.get('apprisk', 'high'), 2)
             tags = ["p2p", event_data.get('app', 'unknown').lower()]
-            artifacts = self.create_p2p_artifacts(src_ip, events)
+            
         
         alert = {
             "title": title,
@@ -144,45 +147,109 @@ class FortiGateAlertProcessor:
             "severity": severity,
             "date": int(datetime.now().timestamp() * 1000),
             "tags": tags,
-            "artifacts": artifacts,
+            
             "tlp": 2,
             "pap": 2
         }
         
-        return self.send_to_thehive(alert, source_ref,events)
+        return self.send_to_thehive(alert, source_ref,events,alert_type)
     
 
-    def send_to_thehive(self, alert, source_ref,events):
+    def send_to_thehive(self, alert, source_ref, events,alert_type):
+    
         try:
             headers = {"Authorization": f"Bearer {THEHIVE_API_KEY}"}
-            
-            # Check if alert exists
+        
+        # Check if alert exists
             response = self.session.get(
-                f"{THEHIVE_URL}/api/v1/alert?sourceRef={source_ref}",
-                headers=headers,
-                timeout=10
-            )
-            
+            f"{THEHIVE_URL}/api/v1/alert?sourceRef={source_ref}",
+            headers=headers,
+            timeout=10
+        )
+        
             if response.status_code == 200 and response.json():
                 logger.debug(f"Alert already exists: {source_ref}")
                 return False
-                
-            # Create new alert
+            
+        # Create new alert
             response = self.session.post(
                 f"{THEHIVE_URL}/api/v1/alert",
-                headers=headers,
-                json=alert,
-                timeout=30
+            headers=headers,
+            json=alert,
+            timeout=30
+        )
+        
+            if response.status_code == 201:
+                alert_id = response.json().get("id", response.json().get("_id"))
+            # Get src_ip from the events data
+                src_ip = events[0].get('srcip', 'unknown') if events else 'unknown'
+                logger.info(f"Alert created successfully for {src_ip} (ID: {alert_id})")
+            
+            # Call extract_artifacts correctly
+                for obs in self.extract_artifacts(events, alert_type):
+                    self.session.post(
+                        f"{THEHIVE_URL}/api/v1/alert/{alert_id}/artifact",
+                    headers=headers,
+                    data=json.dumps(obs)
             )
+                return self.session.json()
             
-            
-                return response.json()
-                
             logger.error(f"Failed to create alert: {response.text}")
             return False
         except Exception as e:
             logger.error(f"Error sending to TheHive: {str(e)}")
             return False
+
+    
+    def extract_artifacts(self, events, alert_type):
+    
+        artifacts = []
+
+        if not events:
+            return artifacts
+
+        src_ip = events[0].get('srcip')
+        if src_ip:
+            artifacts.append({
+            "dataType": "ip",
+            "data": src_ip,
+            "tags": ["fortigate", "attacker" if alert_type == "ips" else "p2p-user"]
+        })
+
+        if alert_type == "ips":
+            dst_ips = {event.get('dstip') for event in events if event.get('dstip')}
+            for ip in dst_ips:
+                artifacts.append({
+                "dataType": "ip",
+                "data": ip,
+                "tags": ["fortigate", "target"]
+            })
+    
+            attack = events[0].get('attack')
+            if attack:
+                artifacts.append({
+                "dataType": "other",
+                "data": attack,
+                "tags": ["fortigate", "attack-pattern"]
+            })
+        else:
+        # For P2P alerts
+            apps = {event.get('app') for event in events if event.get('app')}
+            for app in apps:
+                artifacts.append({
+                "dataType": "other",
+                "data": app,
+                "tags": ["fortigate", "p2p-application"]
+            })
+            dst_ips = {event.get('dstip') for event in events if event.get('dstip')}
+            for dst_ip in dst_ips:
+                artifacts.append({
+                "dataType": "ip",
+                "data": dst_ip,
+                "tags": ["fortigate", "p2p-destination"]
+            })
+
+        return artifacts
 
     def format_ips_description(self, src_ip, events):
         desc = [
@@ -220,19 +287,7 @@ class FortiGateAlertProcessor:
             
         return "\n".join(desc)
 
-    def create_ips_artifacts(self, src_ip, events):
-        return [
-            {"dataType": "ip", "data": src_ip, "tags": ["src"]},
-            {"dataType": "ip", "data": events[0].get('dstip'), "tags": ["dst"]},
-            {"dataType": "other", "data": events[0].get('attack'), "tags": ["attack"]}
-        ]
 
-    def create_p2p_artifacts(self, src_ip, events):
-        return [
-            {"dataType": "ip", "data": src_ip, "tags": ["src"]},
-            {"dataType": "ip", "data": events[0].get('dstip'), "tags": ["dst"]},
-            {"dataType": "other", "data": events[0].get('app'), "tags": ["p2p"]}
-        ]
 
 def main():
     logger.info("Starting FortiGate alert processor")
@@ -245,4 +300,4 @@ def main():
     logger.info(f"Processing complete - IPS: {ips_count} alerts | P2P: {p2p_count} alerts")
 
 if __name__ == "__main__":
-    main()
+    main() 
